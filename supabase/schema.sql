@@ -1,4 +1,4 @@
--- Boxed Up HQ / Supabase schema v3
+-- Boxed Up HQ / Supabase schema v2
 -- Run this entire file in Supabase -> SQL Editor.
 -- It is safe to re-run and upgrades the original Boxed Up HQ schema.
 --
@@ -7,7 +7,6 @@
 -- * RLS enforces access based on workspace membership and role permissions.
 -- * The bootstrap owner is locked to dxvil6354@gmail.com.
 -- * Only that protected owner can hold the owner role.
--- * Workflow approvals, shipping permissions, dependencies and activity history are enforced server-side.
 
 create extension if not exists pgcrypto;
 
@@ -71,7 +70,7 @@ create table if not exists public.items (
   workspace_id uuid not null references public.workspaces(id) on delete cascade,
   tracker_id uuid not null references public.trackers(id) on delete cascade,
   title text not null check (char_length(title) between 1 and 180),
-  status text not null default 'Ready' check (status in ('Backlog','Ready','In progress','Review','Testing','Approved','Shipped')),
+  status text not null default 'Not started' check (status in ('Not started','In progress','Done')),
   priority text check (priority is null or priority in ('Low','Medium','High','Urgent')),
   item_type text,
   description text,
@@ -98,32 +97,6 @@ create table if not exists public.workspace_invites (
   created_at timestamptz not null default now()
 );
 
-create table if not exists public.activity_log (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid not null references public.workspaces(id) on delete cascade,
-  actor_id uuid references auth.users(id) on delete set null,
-  action text not null,
-  entity_type text not null,
-  entity_id uuid,
-  entity_title text,
-  metadata jsonb not null default '{}'::jsonb,
-  created_at timestamptz not null default now()
-);
-
--- Upgrade the original workflow in-place.
-alter table public.items drop constraint if exists items_status_check;
-update public.items
-set status = case
-  when status = 'Not started' then 'Ready'
-  when status = 'Done' then 'Shipped'
-  else status
-end
-where status in ('Not started', 'Done');
-alter table public.items alter column status set default 'Ready';
-alter table public.items
-  add constraint items_status_check
-  check (status in ('Backlog','Ready','In progress','Review','Testing','Approved','Shipped'));
-
 -- Upgrade the original v1 role enum/check constraints to flexible workspace roles.
 alter table public.workspace_members drop constraint if exists workspace_members_role_check;
 alter table public.workspace_invites drop constraint if exists workspace_invites_role_check;
@@ -133,11 +106,8 @@ create index if not exists idx_workspace_roles_workspace on public.workspace_rol
 create index if not exists idx_trackers_workspace on public.trackers(workspace_id, sort_order);
 create index if not exists idx_items_tracker on public.items(tracker_id, status, sort_order);
 create index if not exists idx_items_workspace on public.items(workspace_id);
-drop index if exists public.idx_items_assignee_due;
-create index idx_items_assignee_due on public.items(assignee_id, due_date) where status <> 'Shipped';
+create index if not exists idx_items_assignee_due on public.items(assignee_id, due_date) where status <> 'Done';
 create index if not exists idx_invites_workspace on public.workspace_invites(workspace_id, created_at desc);
-create index if not exists idx_activity_workspace_created on public.activity_log(workspace_id, created_at desc);
-create index if not exists idx_activity_entity on public.activity_log(entity_id, created_at desc);
 
 -- Default roles for existing and future workspaces.
 insert into public.workspace_roles (workspace_id, role_key, name, description, color, permissions, is_system, sort_order)
@@ -146,24 +116,15 @@ from public.workspaces w
 cross join (
   values
     ('owner', 'Owner', 'Protected workspace owner. Full access.', 'yellow',
-      '{"items.create":true,"items.edit":true,"items.approve":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"updates.ship":true,"members.invite":true,"members.manage":true,"workspace.manage":true}'::jsonb, 10),
+      '{"items.create":true,"items.edit":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"members.invite":true,"members.manage":true,"workspace.manage":true}'::jsonb, 10),
     ('admin', 'Admin', 'Manages production, trackers and team members.', 'red',
-      '{"items.create":true,"items.edit":true,"items.approve":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"updates.ship":true,"members.invite":true,"members.manage":true,"workspace.manage":false}'::jsonb, 20),
+      '{"items.create":true,"items.edit":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"members.invite":true,"members.manage":true,"workspace.manage":false}'::jsonb, 20),
     ('developer', 'Developer', 'Creates and updates production work.', 'blue',
-      '{"items.create":true,"items.edit":true,"items.approve":false,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":false,"updates.ship":false,"members.invite":false,"members.manage":false,"workspace.manage":false}'::jsonb, 30),
+      '{"items.create":true,"items.edit":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":false,"members.invite":false,"members.manage":false,"workspace.manage":false}'::jsonb, 30),
     ('viewer', 'Viewer', 'Read-only workspace access.', 'gray',
-      '{"items.create":false,"items.edit":false,"items.approve":false,"items.delete":false,"trackers.create":false,"trackers.edit":false,"trackers.delete":false,"updates.ship":false,"members.invite":false,"members.manage":false,"workspace.manage":false}'::jsonb, 40)
+      '{"items.create":false,"items.edit":false,"items.delete":false,"trackers.create":false,"trackers.edit":false,"trackers.delete":false,"members.invite":false,"members.manage":false,"workspace.manage":false}'::jsonb, 40)
 ) as r(role_key, name, description, color, permissions, sort_order)
 on conflict (workspace_id, role_key) do nothing;
-
--- Add newly introduced permission keys without overwriting any choices the Owner
--- has already made for existing roles.
-update public.workspace_roles
-set permissions = '{"items.approve":true,"updates.ship":true}'::jsonb || permissions
-where role_key in ('owner','admin');
-update public.workspace_roles
-set permissions = '{"items.approve":false,"updates.ship":false}'::jsonb || permissions
-where role_key not in ('owner','admin');
 
 -- Migrate old editor memberships/invites into the Developer role.
 update public.workspace_members set role = 'developer' where role = 'editor';
@@ -428,257 +389,6 @@ grant execute on function public.has_workspace_permission(uuid,text) to authenti
 grant execute on function public.shares_workspace(uuid) to authenticated;
 grant execute on function public.is_protected_owner_member(uuid,uuid) to authenticated;
 
--- Workflow transition enforcement.
-create or replace function public.enforce_item_workflow()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_dependency text;
-begin
-  if new.custom_data ? 'blocked_by' and jsonb_typeof(new.custom_data->'blocked_by') <> 'array' then
-    raise exception 'blocked_by must be an array.';
-  end if;
-
-  if new.custom_data ? 'blocked_by' then
-    for v_dependency in
-      select value from jsonb_array_elements_text(new.custom_data->'blocked_by')
-    loop
-      if v_dependency = new.id::text then
-        raise exception 'A task cannot depend on itself.';
-      end if;
-      if not exists (
-        select 1 from public.items dependency
-        where dependency.id::text = v_dependency
-          and dependency.workspace_id = new.workspace_id
-      ) then
-        raise exception 'A dependency does not exist in this workspace.';
-      end if;
-    end loop;
-  end if;
-
-  if tg_op = 'INSERT' or new.status is distinct from old.status then
-    if new.status = 'Approved' and not public.has_workspace_permission(new.workspace_id, 'items.approve') then
-      raise exception 'Your role cannot approve tasks.';
-    end if;
-    if new.status = 'Shipped' and not public.has_workspace_permission(new.workspace_id, 'updates.ship') then
-      raise exception 'Your role cannot mark tasks as shipped.';
-    end if;
-
-    if new.status in ('Approved','Shipped')
-      and new.custom_data ? 'blocked_by'
-      and exists (
-        select 1
-        from jsonb_array_elements_text(new.custom_data->'blocked_by') dependency_id(value)
-        join public.items dependency
-          on dependency.id::text = dependency_id.value
-         and dependency.workspace_id = new.workspace_id
-        where dependency.status not in ('Approved','Shipped')
-      )
-    then
-      raise exception 'Resolve all task dependencies before approving or shipping this task.';
-    end if;
-  end if;
-
-  return new;
-end;
-$$;
-
-drop trigger if exists items_enforce_workflow on public.items;
-create trigger items_enforce_workflow
-before insert or update on public.items
-for each row execute function public.enforce_item_workflow();
-
--- Shared activity history. Direct browser inserts are not required; these
--- SECURITY DEFINER triggers record meaningful changes made through RLS.
-create or replace function public.log_item_activity()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_action text;
-  v_workspace uuid;
-  v_entity uuid;
-  v_title text;
-  v_metadata jsonb := '{}'::jsonb;
-begin
-  if tg_op = 'INSERT' then
-    v_action := 'created';
-    v_workspace := new.workspace_id;
-    v_entity := new.id;
-    v_title := new.title;
-    v_metadata := jsonb_build_object('status', new.status, 'assignee_id', new.assignee_id);
-  elsif tg_op = 'DELETE' then
-    v_action := 'deleted';
-    v_workspace := old.workspace_id;
-    v_entity := old.id;
-    v_title := old.title;
-    v_metadata := jsonb_build_object('status', old.status, 'assignee_id', old.assignee_id);
-  else
-    v_workspace := new.workspace_id;
-    v_entity := new.id;
-    v_title := new.title;
-
-    if new.status is distinct from old.status then
-      v_action := 'status_changed';
-      v_metadata := jsonb_build_object(
-        'from_status', old.status,
-        'to_status', new.status,
-        'assignee_id', new.assignee_id
-      );
-    elsif new.assignee_id is distinct from old.assignee_id then
-      v_action := 'assigned';
-      v_metadata := jsonb_build_object(
-        'from_assignee_id', old.assignee_id,
-        'assignee_id', new.assignee_id
-      );
-    elsif new.due_date is distinct from old.due_date then
-      v_action := 'due_date_changed';
-      v_metadata := jsonb_build_object(
-        'from_due_date', old.due_date,
-        'to_due_date', new.due_date,
-        'assignee_id', new.assignee_id
-      );
-    elsif new.custom_data is distinct from old.custom_data then
-      v_action := 'dependencies_changed';
-      v_metadata := jsonb_build_object('assignee_id', new.assignee_id);
-    elsif new.title is distinct from old.title
-       or new.description is distinct from old.description
-       or new.priority is distinct from old.priority
-       or new.effort_level is distinct from old.effort_level
-       or new.item_type is distinct from old.item_type
-       or new.tracker_id is distinct from old.tracker_id
-       or new.progress is distinct from old.progress then
-      v_action := 'updated';
-      v_metadata := jsonb_build_object('assignee_id', new.assignee_id);
-    else
-      return new;
-    end if;
-  end if;
-
-  insert into public.activity_log (
-    workspace_id, actor_id, action, entity_type, entity_id, entity_title, metadata
-  ) values (
-    v_workspace, auth.uid(), v_action, 'item', v_entity, v_title, v_metadata
-  );
-
-  if tg_op = 'DELETE' then return old; end if;
-  return new;
-end;
-$$;
-
-drop trigger if exists items_activity_log on public.items;
-create trigger items_activity_log
-after insert or update or delete on public.items
-for each row execute function public.log_item_activity();
-
-create or replace function public.log_tracker_activity()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_action text;
-  v_workspace uuid;
-  v_entity uuid;
-  v_title text;
-begin
-  if tg_op = 'INSERT' then
-    v_action := 'created';
-    v_workspace := new.workspace_id;
-    v_entity := new.id;
-    v_title := new.name;
-  elsif tg_op = 'DELETE' then
-    v_action := 'deleted';
-    v_workspace := old.workspace_id;
-    v_entity := old.id;
-    v_title := old.name;
-  else
-    if new.name is not distinct from old.name
-      and new.description is not distinct from old.description
-      and new.kind is not distinct from old.kind
-      and new.settings is not distinct from old.settings
-      and new.archived is not distinct from old.archived then
-      return new;
-    end if;
-    v_action := 'updated';
-    v_workspace := new.workspace_id;
-    v_entity := new.id;
-    v_title := new.name;
-  end if;
-
-  insert into public.activity_log (
-    workspace_id, actor_id, action, entity_type, entity_id, entity_title
-  ) values (
-    v_workspace, auth.uid(), v_action, 'tracker', v_entity, v_title
-  );
-
-  if tg_op = 'DELETE' then return old; end if;
-  return new;
-end;
-$$;
-
-drop trigger if exists trackers_activity_log on public.trackers;
-create trigger trackers_activity_log
-after insert or update or delete on public.trackers
-for each row execute function public.log_tracker_activity();
-
-create or replace function public.log_member_activity()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_action text;
-  v_workspace uuid;
-  v_user uuid;
-  v_metadata jsonb := '{}'::jsonb;
-begin
-  if tg_op = 'INSERT' then
-    v_action := 'member_joined';
-    v_workspace := new.workspace_id;
-    v_user := new.user_id;
-    v_metadata := jsonb_build_object('to_role', new.role, 'user_id', new.user_id);
-  elsif tg_op = 'DELETE' then
-    v_action := 'member_removed';
-    v_workspace := old.workspace_id;
-    v_user := old.user_id;
-    v_metadata := jsonb_build_object('from_role', old.role, 'user_id', old.user_id);
-  else
-    if new.role is not distinct from old.role then return new; end if;
-    v_action := 'role_changed';
-    v_workspace := new.workspace_id;
-    v_user := new.user_id;
-    v_metadata := jsonb_build_object('from_role', old.role, 'to_role', new.role, 'user_id', new.user_id);
-  end if;
-
-  insert into public.activity_log (
-    workspace_id, actor_id, action, entity_type, entity_id, entity_title, metadata
-  ) values (
-    v_workspace, auth.uid(), v_action, 'member', v_user, 'team member', v_metadata
-  );
-
-  if tg_op = 'DELETE' then return old; end if;
-  return new;
-end;
-$$;
-
-drop trigger if exists workspace_members_activity_log on public.workspace_members;
-create trigger workspace_members_activity_log
-after insert or update or delete on public.workspace_members
-for each row execute function public.log_member_activity();
-
-revoke all on function public.enforce_item_workflow() from public;
-revoke all on function public.log_item_activity() from public;
-revoke all on function public.log_tracker_activity() from public;
-revoke all on function public.log_member_activity() from public;
-
 -- RLS
 alter table public.profiles enable row level security;
 alter table public.workspaces enable row level security;
@@ -687,7 +397,6 @@ alter table public.workspace_members enable row level security;
 alter table public.trackers enable row level security;
 alter table public.items enable row level security;
 alter table public.workspace_invites enable row level security;
-alter table public.activity_log enable row level security;
 
 -- Profiles
 DROP POLICY IF EXISTS "profiles_select_shared_workspace" ON public.profiles;
@@ -862,12 +571,6 @@ create policy "items_delete_permission" on public.items
 for delete to authenticated
 using (public.has_workspace_permission(workspace_id, 'items.delete'));
 
--- Activity log
-DROP POLICY IF EXISTS "activity_select_member" ON public.activity_log;
-create policy "activity_select_member" on public.activity_log
-for select to authenticated
-using (public.is_workspace_member(workspace_id));
-
 -- Invites
 DROP POLICY IF EXISTS "invites_select_owner" ON public.workspace_invites;
 DROP POLICY IF EXISTS "invites_select_manager" ON public.workspace_invites;
@@ -975,13 +678,13 @@ begin
   insert into public.workspace_roles (workspace_id, role_key, name, description, color, permissions, is_system, sort_order)
   values
     (v_workspace, 'owner', 'Owner', 'Protected workspace owner. Full access.', 'yellow',
-      '{"items.create":true,"items.edit":true,"items.approve":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"updates.ship":true,"members.invite":true,"members.manage":true,"workspace.manage":true}', true, 10),
+      '{"items.create":true,"items.edit":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"members.invite":true,"members.manage":true,"workspace.manage":true}', true, 10),
     (v_workspace, 'admin', 'Admin', 'Manages production, trackers and team members.', 'red',
-      '{"items.create":true,"items.edit":true,"items.approve":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"updates.ship":true,"members.invite":true,"members.manage":true,"workspace.manage":false}', true, 20),
+      '{"items.create":true,"items.edit":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":true,"members.invite":true,"members.manage":true,"workspace.manage":false}', true, 20),
     (v_workspace, 'developer', 'Developer', 'Creates and updates production work.', 'blue',
-      '{"items.create":true,"items.edit":true,"items.approve":false,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":false,"updates.ship":false,"members.invite":false,"members.manage":false,"workspace.manage":false}', true, 30),
+      '{"items.create":true,"items.edit":true,"items.delete":true,"trackers.create":true,"trackers.edit":true,"trackers.delete":false,"members.invite":false,"members.manage":false,"workspace.manage":false}', true, 30),
     (v_workspace, 'viewer', 'Viewer', 'Read-only workspace access.', 'gray',
-      '{"items.create":false,"items.edit":false,"items.approve":false,"items.delete":false,"trackers.create":false,"trackers.edit":false,"trackers.delete":false,"updates.ship":false,"members.invite":false,"members.manage":false,"workspace.manage":false}', true, 40);
+      '{"items.create":false,"items.edit":false,"items.delete":false,"trackers.create":false,"trackers.edit":false,"trackers.delete":false,"members.invite":false,"members.manage":false,"workspace.manage":false}', true, 40);
 
   insert into public.workspace_members (workspace_id, user_id, role)
   values (v_workspace, auth.uid(), 'owner');
@@ -995,7 +698,7 @@ begin
   returning id into v_todo;
 
   insert into public.trackers (workspace_id, name, icon, description, kind, sort_order, settings, created_by)
-  values (v_workspace, 'Weekly Update Checklist', '🛠️', 'Next Update: 11th September 2026', 'table', 30, '{"tablePreset":"tasks","isCurrentUpdate":true,"updateTitle":"F1 Update","releaseDate":"2026-09-11","shipStage":"planning"}', auth.uid())
+  values (v_workspace, 'Weekly Update Checklist', '🛠️', 'Next Update: 11th September 2026', 'table', 30, '{"tablePreset":"tasks"}', auth.uid())
   returning id into v_weekly;
 
   insert into public.trackers (workspace_id, name, icon, description, kind, sort_order, settings, created_by)
@@ -1010,10 +713,10 @@ begin
     workspace_id, tracker_id, title, status, priority, item_type, description,
     effort_level, due_date, progress, sort_order, created_by
   ) values
-    (v_workspace, v_weekly, 'F1 Vehicles', 'Ready', 'Medium', '🚗 Vehicle', 'Add the F1 vehicles, fix timers', 'Medium', '2026-09-10', 0, 10, auth.uid()),
-    (v_workspace, v_weekly, 'F1 Zone', 'Ready', 'High', '🔧 Map', 'Add F1 to the weekly zone', 'Large', '2026-09-10', 0, 20, auth.uid()),
-    (v_workspace, v_weekly, 'Event Board + Event Creation', 'Ready', 'Medium', '🎉 Event', 'Update timer, change event ID', 'Small', '2026-09-10', 0, 30, auth.uid()),
-    (v_workspace, v_weekly, 'Dev Product Images', 'Ready', 'Low', '🦩 Polish', 'Do the dev product images', 'Small', '2026-09-10', 0, 40, auth.uid()),
+    (v_workspace, v_weekly, 'F1 Vehicles', 'Not started', 'Medium', '🚗 Vehicle', 'Add the F1 vehicles, fix timers', 'Medium', '2026-09-10', 0, 10, auth.uid()),
+    (v_workspace, v_weekly, 'F1 Zone', 'Not started', 'High', '🔧 Map', 'Add F1 to the weekly zone', 'Large', '2026-09-10', 0, 20, auth.uid()),
+    (v_workspace, v_weekly, 'Event Board + Event Creation', 'Not started', 'Medium', '🎉 Event', 'Update timer, change event ID', 'Small', '2026-09-10', 0, 30, auth.uid()),
+    (v_workspace, v_weekly, 'Dev Product Images', 'Not started', 'Low', '🦩 Polish', 'Do the dev product images', 'Small', '2026-09-10', 0, 40, auth.uid()),
     (v_workspace, v_scripts, 'Admin panel', 'In progress', 'Medium', '💻 Script', 'Build and wire the admin panel.', 'Medium', null, 0, 10, auth.uid());
 
   return v_workspace;
@@ -1032,7 +735,6 @@ grant select, update, delete on public.workspace_members to authenticated;
 grant select, insert, update, delete on public.trackers to authenticated;
 grant select, insert, update, delete on public.items to authenticated;
 grant select, insert, delete on public.workspace_invites to authenticated;
-grant select on public.activity_log to authenticated;
 
 -- Realtime collaborative edits.
 do $$
@@ -1048,8 +750,5 @@ begin
   end if;
   if not exists (select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='workspace_roles') then
     alter publication supabase_realtime add table public.workspace_roles;
-  end if;
-  if not exists (select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='activity_log') then
-    alter publication supabase_realtime add table public.activity_log;
   end if;
 end $$;
