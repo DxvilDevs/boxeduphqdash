@@ -1,4 +1,4 @@
--- Boxed Up HQ / Supabase schema v2
+-- Boxed Up HQ / Supabase schema v2 
 -- Run this entire file in Supabase -> SQL Editor.
 -- It is safe to re-run and upgrades the original Boxed Up HQ schema.
 --
