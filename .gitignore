@@ -1,0 +1,10 @@
+# Generated locally or by GitHub Actions.
+config.js
+
+# Build output.
+dist/
+
+# Local/editor noise.
+.DS_Store
+Thumbs.db
+.vscode/
