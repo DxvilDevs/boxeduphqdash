@@ -752,3 +752,277 @@ begin
     alter publication supabase_realtime add table public.workspace_roles;
   end if;
 end $$;
+
+
+-- ============================================================================
+-- Lightweight collaboration additions: Studio Feed only.
+-- Keeps the original task statuses: Not started / In progress / Done.
+-- Online status uses Supabase Realtime Presence and does not require a table.
+-- My Work is a filtered view of existing items and does not require a table.
+-- ============================================================================
+
+-- Hard-restore the simple original workflow in case the earlier experimental
+-- workflow migration was ever applied. This preserves every task and only maps
+-- the experimental labels back to the original three Notion-style statuses.
+drop trigger if exists items_enforce_workflow on public.items;
+drop function if exists public.enforce_item_workflow();
+
+alter table public.items drop constraint if exists items_status_check;
+update public.items
+set status = case
+  when status in ('Backlog','Ready') then 'Not started'
+  when status in ('Review','Testing','Approved') then 'In progress'
+  when status = 'Shipped' then 'Done'
+  else status
+end
+where status in ('Backlog','Ready','Review','Testing','Approved','Shipped');
+alter table public.items alter column status set default 'Not started';
+alter table public.items
+  add constraint items_status_check
+  check (status in ('Not started','In progress','Done'));
+
+drop index if exists public.idx_items_assignee_due;
+create index idx_items_assignee_due
+  on public.items(assignee_id, due_date)
+  where status <> 'Done';
+
+-- Remove permission flags that belonged only to the discarded workflow.
+update public.workspace_roles
+set permissions = permissions - 'items.approve' - 'updates.ship'
+where permissions ? 'items.approve' or permissions ? 'updates.ship';
+
+create table if not exists public.activity_log (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  actor_id uuid references auth.users(id) on delete set null,
+  action text not null,
+  entity_type text not null,
+  entity_id uuid,
+  entity_title text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_activity_workspace_created on public.activity_log(workspace_id, created_at desc);
+create index if not exists idx_activity_entity on public.activity_log(entity_id, created_at desc);
+
+-- If the abandoned workflow ever wrote feed entries, normalise those labels too.
+update public.activity_log
+set metadata = jsonb_strip_nulls(
+  metadata
+  || case when metadata ? 'status' then jsonb_build_object('status', case metadata->>'status'
+       when 'Backlog' then 'Not started' when 'Ready' then 'Not started'
+       when 'Review' then 'In progress' when 'Testing' then 'In progress' when 'Approved' then 'In progress'
+       when 'Shipped' then 'Done' else metadata->>'status' end) else '{}'::jsonb end
+  || case when metadata ? 'from_status' then jsonb_build_object('from_status', case metadata->>'from_status'
+       when 'Backlog' then 'Not started' when 'Ready' then 'Not started'
+       when 'Review' then 'In progress' when 'Testing' then 'In progress' when 'Approved' then 'In progress'
+       when 'Shipped' then 'Done' else metadata->>'from_status' end) else '{}'::jsonb end
+  || case when metadata ? 'to_status' then jsonb_build_object('to_status', case metadata->>'to_status'
+       when 'Backlog' then 'Not started' when 'Ready' then 'Not started'
+       when 'Review' then 'In progress' when 'Testing' then 'In progress' when 'Approved' then 'In progress'
+       when 'Shipped' then 'Done' else metadata->>'to_status' end) else '{}'::jsonb end
+);
+
+-- Record meaningful task changes without adding any new workflow stages.
+create or replace function public.log_item_activity()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_action text;
+  v_workspace uuid;
+  v_entity uuid;
+  v_title text;
+  v_metadata jsonb := '{}'::jsonb;
+begin
+  if tg_op = 'INSERT' then
+    v_action := 'created';
+    v_workspace := new.workspace_id;
+    v_entity := new.id;
+    v_title := new.title;
+    v_metadata := jsonb_build_object('status', new.status, 'assignee_id', new.assignee_id, 'tracker_id', new.tracker_id);
+  elsif tg_op = 'DELETE' then
+    v_action := 'deleted';
+    v_workspace := old.workspace_id;
+    v_entity := old.id;
+    v_title := old.title;
+    v_metadata := jsonb_build_object('status', old.status, 'assignee_id', old.assignee_id, 'tracker_id', old.tracker_id);
+  else
+    v_workspace := new.workspace_id;
+    v_entity := new.id;
+    v_title := new.title;
+
+    if new.status is distinct from old.status then
+      v_action := 'status_changed';
+      v_metadata := jsonb_build_object(
+        'from_status', old.status,
+        'to_status', new.status,
+        'assignee_id', new.assignee_id,
+        'tracker_id', new.tracker_id
+      );
+    elsif new.assignee_id is distinct from old.assignee_id then
+      v_action := 'assigned';
+      v_metadata := jsonb_build_object(
+        'from_assignee_id', old.assignee_id,
+        'assignee_id', new.assignee_id,
+        'tracker_id', new.tracker_id
+      );
+    elsif new.due_date is distinct from old.due_date then
+      v_action := 'due_date_changed';
+      v_metadata := jsonb_build_object(
+        'from_due_date', old.due_date,
+        'to_due_date', new.due_date,
+        'assignee_id', new.assignee_id,
+        'tracker_id', new.tracker_id
+      );
+    elsif new.title is distinct from old.title
+       or new.description is distinct from old.description
+       or new.priority is distinct from old.priority
+       or new.effort_level is distinct from old.effort_level
+       or new.item_type is distinct from old.item_type
+       or new.tracker_id is distinct from old.tracker_id
+       or new.progress is distinct from old.progress then
+      v_action := 'updated';
+      v_metadata := jsonb_build_object('assignee_id', new.assignee_id, 'tracker_id', new.tracker_id);
+    else
+      return new;
+    end if;
+  end if;
+
+  insert into public.activity_log (
+    workspace_id, actor_id, action, entity_type, entity_id, entity_title, metadata
+  ) values (
+    v_workspace, auth.uid(), v_action, 'item', v_entity, v_title, v_metadata
+  );
+
+  if tg_op = 'DELETE' then return old; end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists items_activity_log on public.items;
+create trigger items_activity_log
+after insert or update or delete on public.items
+for each row execute function public.log_item_activity();
+
+create or replace function public.log_tracker_activity()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_action text;
+  v_workspace uuid;
+  v_entity uuid;
+  v_title text;
+begin
+  if tg_op = 'INSERT' then
+    v_action := 'created';
+    v_workspace := new.workspace_id;
+    v_entity := new.id;
+    v_title := new.name;
+  elsif tg_op = 'DELETE' then
+    v_action := 'deleted';
+    v_workspace := old.workspace_id;
+    v_entity := old.id;
+    v_title := old.name;
+  else
+    if new.name is not distinct from old.name
+      and new.description is not distinct from old.description
+      and new.kind is not distinct from old.kind
+      and new.archived is not distinct from old.archived then
+      return new;
+    end if;
+    v_action := 'updated';
+    v_workspace := new.workspace_id;
+    v_entity := new.id;
+    v_title := new.name;
+  end if;
+
+  insert into public.activity_log (
+    workspace_id, actor_id, action, entity_type, entity_id, entity_title
+  ) values (
+    v_workspace, auth.uid(), v_action, 'tracker', v_entity, v_title
+  );
+
+  if tg_op = 'DELETE' then return old; end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trackers_activity_log on public.trackers;
+create trigger trackers_activity_log
+after insert or update or delete on public.trackers
+for each row execute function public.log_tracker_activity();
+
+create or replace function public.log_member_activity()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_action text;
+  v_workspace uuid;
+  v_user uuid;
+  v_metadata jsonb := '{}'::jsonb;
+begin
+  if tg_op = 'INSERT' then
+    v_action := 'member_joined';
+    v_workspace := new.workspace_id;
+    v_user := new.user_id;
+    v_metadata := jsonb_build_object('to_role', new.role, 'user_id', new.user_id);
+  elsif tg_op = 'DELETE' then
+    v_action := 'member_removed';
+    v_workspace := old.workspace_id;
+    v_user := old.user_id;
+    v_metadata := jsonb_build_object('from_role', old.role, 'user_id', old.user_id);
+  else
+    if new.role is not distinct from old.role then return new; end if;
+    v_action := 'role_changed';
+    v_workspace := new.workspace_id;
+    v_user := new.user_id;
+    v_metadata := jsonb_build_object('from_role', old.role, 'to_role', new.role, 'user_id', new.user_id);
+  end if;
+
+  insert into public.activity_log (
+    workspace_id, actor_id, action, entity_type, entity_id, entity_title, metadata
+  ) values (
+    v_workspace, auth.uid(), v_action, 'member', v_user, 'team member', v_metadata
+  );
+
+  if tg_op = 'DELETE' then return old; end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists workspace_members_activity_log on public.workspace_members;
+create trigger workspace_members_activity_log
+after insert or update or delete on public.workspace_members
+for each row execute function public.log_member_activity();
+
+revoke all on function public.log_item_activity() from public;
+revoke all on function public.log_tracker_activity() from public;
+revoke all on function public.log_member_activity() from public;
+
+alter table public.activity_log enable row level security;
+DROP POLICY IF EXISTS "activity_select_member" ON public.activity_log;
+create policy "activity_select_member" on public.activity_log
+for select to authenticated
+using (public.is_workspace_member(workspace_id));
+
+grant select on public.activity_log to authenticated;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname='supabase_realtime' and schemaname='public' and tablename='activity_log'
+  ) then
+    alter publication supabase_realtime add table public.activity_log;
+  end if;
+end $$;
