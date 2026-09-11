@@ -77,6 +77,7 @@ create table if not exists public.items (
   effort_level text check (effort_level is null or effort_level in ('Small','Medium','Large')),
   due_date date,
   assignee_id uuid references auth.users(id) on delete set null,
+  checklist jsonb not null default '[]'::jsonb,
   progress integer not null default 0 check (progress between 0 and 100),
   sort_order integer not null default 0,
   custom_data jsonb not null default '{}'::jsonb,
@@ -98,6 +99,8 @@ create table if not exists public.workspace_invites (
 );
 
 -- Upgrade the original v1 role enum/check constraints to flexible workspace roles.
+-- Checklist is additive and preserves all existing tasks/users.
+alter table public.items add column if not exists checklist jsonb not null default '[]'::jsonb;
 alter table public.workspace_members drop constraint if exists workspace_members_role_check;
 alter table public.workspace_invites drop constraint if exists workspace_invites_role_check;
 
@@ -395,6 +398,40 @@ alter table public.workspaces enable row level security;
 alter table public.workspace_roles enable row level security;
 alter table public.workspace_members enable row level security;
 alter table public.trackers enable row level security;
+
+-- Progress is owned by the checklist, not by a manually editable percentage.
+create or replace function public.sync_item_progress_from_checklist()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+declare
+  v_total integer := 0;
+  v_done integer := 0;
+begin
+  if new.checklist is null or jsonb_typeof(new.checklist) <> 'array' then
+    new.checklist := '[]'::jsonb;
+  end if;
+
+  select count(*), count(*) filter (where lower(coalesce(entry->>'done', 'false')) = 'true')
+    into v_total, v_done
+  from jsonb_array_elements(new.checklist) as entry;
+
+  if v_total > 0 then
+    new.progress := round((v_done::numeric / v_total::numeric) * 100)::integer;
+  else
+    new.progress := case when new.status = 'Done' then 100 else 0 end;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists items_sync_progress_from_checklist on public.items;
+create trigger items_sync_progress_from_checklist
+before insert or update on public.items
+for each row execute function public.sync_item_progress_from_checklist();
+
 alter table public.items enable row level security;
 alter table public.workspace_invites enable row level security;
 
@@ -884,6 +921,7 @@ begin
        or new.effort_level is distinct from old.effort_level
        or new.item_type is distinct from old.item_type
        or new.tracker_id is distinct from old.tracker_id
+       or new.checklist is distinct from old.checklist
        or new.progress is distinct from old.progress then
       v_action := 'updated';
       v_metadata := jsonb_build_object('assignee_id', new.assignee_id, 'tracker_id', new.tracker_id);
